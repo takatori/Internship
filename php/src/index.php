@@ -11,6 +11,7 @@ function configure() {
   $username = getenv('ISU4_DB_USER') ?: 'root';
   $password = getenv('ISU4_DB_PASSWORD');
   $db = null;
+  $redis = null;
   try {
     $db = new PDO(
       'mysql:host=' . $host . ';port=' . $port. ';dbname=' . $dbname,
@@ -20,12 +21,17 @@ function configure() {
         PDO::MYSQL_ATTR_INIT_COMMAND => 'SET CHARACTER SET `utf8`',
       ]
     );
+
+    $redis = new Redis();
+    $redis->connect("127.0.0.1", 6379);
+    
   } catch (PDOException $e) {
     halt("Connection faild: $e");
   }
   $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 
   option('db_conn', $db);
+  option('reids_conn', $redis);
 
   $config = [
     'user_lock_threshold' => getenv('ISU4_USER_LOCK_THRESHOLD') ?: 3,
@@ -51,40 +57,61 @@ function calculate_password_hash($password, $salt) {
   return hash('sha256', $password . ':' . $salt);
 }
 
-function login_log($succeeded, $login, $user_id=null) {
-  $db = option('db_conn');
+function redis_key_user($user) {
+    return "isu4:user:#{user[" . $user['login'] . "]}";
+}
 
-  $stmt = $db->prepare('INSERT INTO login_log (`created_at`, `user_id`, `login`, `ip`, `succeeded`) VALUES (NOW(),:user_id,:login,:ip,:succeeded)');
-  $stmt->bindValue(':user_id', $user_id);
-  $stmt->bindValue(':login', $login);
-  $stmt->bindValue(':ip', $_SERVER['REMOTE_ADDR']);
-  $stmt->bindValue(':succeeded', $succeeded ? 1 : 0);
-  $stmt->execute();
+function redis_key_last($user) {
+    return "isu4:last:#{user[" . $user['login'] . "]}";
+}
+
+function redis_key_nextlast($user) {
+    return "isu4:nextlast:#{user[" . $user['login'] . "]}";
+}
+
+function redis_key_ip($ip) {
+    return "isu4:ip:#{" . $ip . "}";
+}
+
+
+
+function login_log($succeeded, $login, $user=null) {
+
+    $redis = option('redis_conn');
+    $kuser = redis_key_user($user);
+    $kip   = redis_key_ip($_SERVER['REMOTE_ADDR']);
+
+    if ($succeeded) {
+        $klast = redis_key_last($user);
+        $knextlast = redis_key_nextlast($user);
+
+        $redis->set($kip, 0);
+        $redis->set($kuser, 0);
+
+        if ($redis->exists($knextlast)) {
+            $reids->rename($knextlast, $klast);
+            $redis->hMset($knextlast, array('login' => $login, 'ip' => $_SERVER['REMOTE_ADDR'], 'at' => date(DATE_ATOM)));
+        } else {
+            $redis->hMset($knextlast, array('login' => $login, 'ip' => $_SERVER['REMOTE_ADDR'], 'at' => date(DATE_ATOM)));
+        }
+    } else {
+        $redis->incr($kip);
+        $redis->incr($kuser);
+    }
 }
 
 function user_locked($user) {
-  if (empty($user)) { return null; }
-
-  $db = option('db_conn');
-  $stmt = $db->prepare('SELECT COUNT(1) AS failures FROM login_log WHERE user_id = :user_id AND id > IFNULL((select id from login_log where user_id = :user_id AND succeeded = 1 ORDER BY id DESC LIMIT 1), 0)');
-  $stmt->bindValue(':user_id', $user['id']);
-  $stmt->execute();
-  $log = $stmt->fetch(PDO::FETCH_ASSOC);
-
-  $config = option('config');
-  return $config['user_lock_threshold'] <= $log['failures'];
+    if (empty($user)) { return null; }
+    $redis = option('redis_conn');
+    $failures = (int)$redis->get(redis_key_user($user));
+    return $config['user_lock_threshold'] <= $failures;
 }
 
-# FIXME
-function ip_banned() {
-  $db = option('db_conn');
-  $stmt = $db->prepare('SELECT COUNT(1) AS failures FROM login_log WHERE ip = :ip AND id > IFNULL((select id from login_log where ip = :ip AND succeeded = 1 ORDER BY id DESC LIMIT 1), 0)');
-  $stmt->bindValue(':ip', $_SERVER['REMOTE_ADDR']);
-  $stmt->execute();
-  $log = $stmt->fetch(PDO::FETCH_ASSOC);
 
-  $config = option('config');
-  return $config['ip_ban_threshold'] <= $log['failures'];
+function ip_banned() {
+    $redis = option('redis_conn');
+    $failures = (int)$redis->get(redis_key_ip($_SERVER['REMOTE_ADDR']));
+    return $config['ip_ban_threshold'] <= $failures;
 }
 
 function attempt_login($login, $password) {
@@ -96,21 +123,22 @@ function attempt_login($login, $password) {
   $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
   if (ip_banned()) {
-    login_log(false, $login, isset($user['id']) ? $user['id'] : null);
+    //login_log(false, $login, isset($user['id']) ? $user['id'] : null);
+    login_log(false, $login, $user);
     return ['error' => 'banned'];
   }
 
   if (user_locked($user)) {
-    login_log(false, $login, $user['id']);
+    login_log(false, $login, $user);
     return ['error' => 'locked'];
   }
 
   if (!empty($user) && calculate_password_hash($password, $user['salt']) == $user['password_hash']) {
-    login_log(true, $login, $user['id']);
+    login_log(true, $login, $user);
     return ['user' => $user];
   }
   elseif (!empty($user)) {
-    login_log(false, $login, $user['id']);
+    login_log(false, $login, $user);
     return ['error' => 'wrong_password'];
   }
   else {
@@ -140,78 +168,40 @@ function current_user() {
 }
 
 function last_login() {
-  $user = current_user();
-  if (empty($user)) {
-    return null;
-  }
-
-  $db = option('db_conn');
-
-  $stmt = $db->prepare('SELECT * FROM login_log WHERE succeeded = 1 AND user_id = :id ORDER BY id DESC LIMIT 2');
-  $stmt->bindValue(':id', $user['id']);
-  $stmt->execute();
-  $stmt->fetch();
-  return $stmt->fetch(PDO::FETCH_ASSOC);
+		$user = current_user();
+		if (empty($user)) {
+				return null;
+		}
+		$redis = option('redis_conn');
+		return $redis->hGetAll(redis_key_last($user)) || $redis->hGetAll(redis_key_nextlast($user));
 }
 
 function banned_ips() {
-  $threshold = option('config')['ip_ban_threshold'];
-  $ips = [];
+   $threshold = option('config')['ip_ban_threshold'];
+   $ips = [];
 
-  $db = option('db_conn');
-
-  $stmt = $db->prepare('SELECT ip FROM (SELECT ip, MAX(succeeded) as max_succeeded, COUNT(1) as cnt FROM login_log GROUP BY ip) AS t0 WHERE t0.max_succeeded = 0 AND t0.cnt >= :threshold');
-  $stmt->bindValue(':threshold', $threshold);
-  $stmt->execute();
-  $not_succeeded = $stmt->fetchAll(PDO::FETCH_COLUMN, 0);
-  $ips = array_merge($not_succeeded);
-
-  $stmt = $db->prepare('SELECT ip, MAX(id) AS last_login_id FROM login_log WHERE succeeded = 1 GROUP by ip');
-  $stmt->execute();
-  $last_succeeds = $stmt->fetchAll();
-
-  foreach ($last_succeeds as $row) {
-    $stmt = $db->prepare('SELECT COUNT(1) AS cnt FROM login_log WHERE ip = :ip AND :id < id');
-    $stmt->bindValue(':ip', $row['ip']);
-    $stmt->bindValue(':id', $row['last_login_id']);
-    $stmt->execute();
-    $count = $stmt->fetch(PDO::FETCH_ASSOC)['cnt'];
-    if ($threshold <= $count) {
-      array_push($ips, $row['ip']);
-    }
-  }
-
-  return $ips;
+	 $redis = option('redis_conn');
+	 foreach($redis->keys('isu4:ip:*') as $key){
+			 $failures = (int)$redis->get($key);
+			 if($threshold <= $failures) {
+					 array_push($ips, $redis->hMGet($key, 'ip'));
+			 }
+	 }
+	 return $ips;
 }
 
 function locked_users() {
-  $threshold = option('config')['user_lock_threshold'];
-  $user_ids = [];
+		$threshold = option('config')['user_lock_threshold'];
+		$user_ids = [];
 
-  $db = option('db_conn');
-
-  $stmt = $db->prepare('SELECT login FROM (SELECT user_id, login, MAX(succeeded) as max_succeeded, COUNT(1) as cnt FROM login_log GROUP BY user_id) AS t0 WHERE t0.user_id IS NOT NULL AND t0.max_succeeded = 0 AND t0.cnt >= :threshold');
-  $stmt->bindValue(':threshold', $threshold);
-  $stmt->execute();
-  $not_succeeded = $stmt->fetchAll(PDO::FETCH_COLUMN, 0);
-  $user_ids = array_merge($not_succeeded);
-
-  $stmt = $db->prepare('SELECT user_id, login, MAX(id) AS last_login_id FROM login_log WHERE user_id IS NOT NULL AND succeeded = 1 GROUP BY user_id');
-  $stmt->execute();
-  $last_succeeds = $stmt->fetchAll();
-
-  foreach ($last_succeeds as $row) {
-    $stmt = $db->prepare('SELECT COUNT(1) AS cnt FROM login_log WHERE user_id = :user_id AND :id < id');
-    $stmt->bindValue(':user_id', $row['user_id']);
-    $stmt->bindValue(':id', $row['last_login_id']);
-    $stmt->execute();
-    $count = $stmt->fetch(PDO::FETCH_ASSOC)['cnt'];
-    if ($threshold <= $count) {
-      array_push($user_ids, $row['login']);
-    }
-  }
-
-  return $user_ids;
+	 $redis = option('redis_conn');
+	 foreach($redis->keys('isu4:user:*') as $key){
+			 $failures = (int)$redis->get($key);
+			 if($threshold <= $failures) {
+					 array_push($user_ids, $redis->hMGet($key, 'login'));
+			 }
+	 }
+	 return $user_ids;
 }
 
 dispatch_get('/', function() {
