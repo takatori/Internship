@@ -52,6 +52,7 @@ function calculate_password_hash($password, $salt) {
 }
 
 function login_log($succeeded, $login, $user_id=null) {
+
   $db = option('db_conn');
 
   $stmt = $db->prepare('INSERT INTO login_log (`created_at`, `user_id`, `login`, `ip`, `succeeded`) VALUES (NOW(),:user_id,:login,:ip,:succeeded)');

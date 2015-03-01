@@ -31,7 +31,7 @@ function configure() {
   $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 
   option('db_conn', $db);
-  option('reids_conn', $redis);
+  option('redis_conn', $redis);
 
   $config = [
     'user_lock_threshold' => getenv('ISU4_USER_LOCK_THRESHOLD') ?: 3,
@@ -58,19 +58,19 @@ function calculate_password_hash($password, $salt) {
 }
 
 function redis_key_user($user) {
-    return "isu4:user:#{user[" . $user['login'] . "]}";
+    return "isu4:user:" . $user['login'];
 }
 
 function redis_key_last($user) {
-    return "isu4:last:#{user[" . $user['login'] . "]}";
+    return "isu4:last:" . $user['login'];
 }
 
-function redis_key_nextlast($user) {
-    return "isu4:nextlast:#{user[" . $user['login'] . "]}";
+function redis_key_nextlast($user=["id" => "*"]) {
+    return "isu4:nextlast:" . $user['login'];
 }
 
 function redis_key_ip($ip) {
-    return "isu4:ip:#{" . $ip . "}";
+    return "isu4:ip:". $ip;
 }
 
 
@@ -78,7 +78,7 @@ function redis_key_ip($ip) {
 function login_log($succeeded, $login, $user=null) {
 
     $redis = option('redis_conn');
-    $kuser = redis_key_user($user);
+    $kuser = empty($user) ? null : redis_key_user($user);
     $kip   = redis_key_ip($_SERVER['REMOTE_ADDR']);
 
     if ($succeeded) {
@@ -101,9 +101,11 @@ function login_log($succeeded, $login, $user=null) {
 }
 
 function user_locked($user) {
-    if (empty($user)) { return null; }
+    if (empty($user)) { return false; }
     $redis = option('redis_conn');
     $failures = (int)$redis->get(redis_key_user($user));
+
+    $config = option('config');
     return $config['user_lock_threshold'] <= $failures;
 }
 
@@ -111,6 +113,9 @@ function user_locked($user) {
 function ip_banned() {
     $redis = option('redis_conn');
     $failures = (int)$redis->get(redis_key_ip($_SERVER['REMOTE_ADDR']));
+    $config = option('config');
+    error_log(print_r($failures, true), 3, "/tmp/php.log");  // /tmp/php.logに記述する
+    error_log("\r\n", 3, "/tmp/php.log");  // /tmp/php.logに記述する
     return $config['ip_ban_threshold'] <= $failures;
 }
 
@@ -122,8 +127,8 @@ function attempt_login($login, $password) {
   $stmt->execute();
   $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
+    error_log(ip_banned(), 3, "/tmp/php.log");  // /tmp/php.logに記述する
   if (ip_banned()) {
-    //login_log(false, $login, isset($user['id']) ? $user['id'] : null);
     login_log(false, $login, $user);
     return ['error' => 'banned'];
   }
@@ -134,6 +139,8 @@ function attempt_login($login, $password) {
   }
 
   if (!empty($user) && calculate_password_hash($password, $user['salt']) == $user['password_hash']) {
+   
+    error_log(print_r($password, true), 3, "/tmp/php.log");  // /tmp/php.logに記述する
     login_log(true, $login, $user);
     return ['user' => $user];
   }
@@ -168,12 +175,12 @@ function current_user() {
 }
 
 function last_login() {
-		$user = current_user();
-		if (empty($user)) {
-				return null;
-		}
-		$redis = option('redis_conn');
-		return $redis->hGetAll(redis_key_last($user)) || $redis->hGetAll(redis_key_nextlast($user));
+	$user = current_user();
+	if (empty($user)) {
+		return null;
+	}
+	$redis = option('redis_conn');
+	return $redis->hGetAll(redis_key_last($user)) || $redis->hGetAll(redis_key_nextlast($user));
 }
 
 function banned_ips() {
@@ -184,7 +191,7 @@ function banned_ips() {
 	 foreach($redis->keys('isu4:ip:*') as $key){
 			 $failures = (int)$redis->get($key);
 			 if($threshold <= $failures) {
-					 array_push($ips, $redis->hMGet($key, 'ip'));
+					 array_push($ips, $key);
 			 }
 	 }
 	 return $ips;
@@ -198,7 +205,7 @@ function locked_users() {
 	 foreach($redis->keys('isu4:user:*') as $key){
 			 $failures = (int)$redis->get($key);
 			 if($threshold <= $failures) {
-					 array_push($user_ids, $redis->hMGet($key, 'login'));
+					 array_push($user_ids, $key);
 			 }
 	 }
 	 return $user_ids;
